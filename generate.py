@@ -26,64 +26,207 @@ HTTP.headers.update({
 })
 HTTP.mount("https://", HTTPAdapter(max_retries=_retry))
 
+# Separate session for Wikidata: it requires an identifiable User-Agent
+# (https://w.wiki/4wJS) and shouldn't carry the ES-specific headers above.
+WIKIDATA_HTTP = requests.Session()
+WIKIDATA_HTTP.headers.update({
+    "User-Agent": "european-sleeper-gtfs/1.0 (https://github.com/deryclem/european-sleeper-gtfs)",
+})
+WIKIDATA_HTTP.mount("https://", HTTPAdapter(max_retries=_retry))
+
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 OUTPUT_ZIP       = Path("gtfs-european-sleeper.zip")
 TIMETABLE_PAGE   = "https://www.europeansleeper.eu/en/timetable"
 
-# Internal route IDs used by the ES website, mapped to train numbers
-ROUTES = {
-    1: "453",
-    2: "452",
-    5: "475",
-    6: "474",
-    7: "401",
-    8: "400",
+TRAIN_NUMBERS = ["453", "452", "475", "474", "401", "400"]
+
+ES_CONSTANTS_API = "https://europeansleeperprod-api.azurewebsites.net/api/constants"
+
+# ES's brand color (bg-dark-aubergine on booking.europeansleeper.eu).
+ROUTE_COLOR = "40002C"
+ROUTE_TEXT_COLOR = "FFFFFF"
+
+# ── Station lookup (European Sleeper official data + Wikidata) ────────────────
+#
+# UIC codes for regularly-served stations come from ES's own booking API
+# (europeansleeperprod-api.azurewebsites.net/api/constants), which spells
+# some names differently than the timetable HTML (e.g. "Rotterdam Centraal"
+# vs "Rotterdam CS") — hence the explicit mapping below rather than a name
+# match. Coordinates aren't in that API, so Wikidata still supplies lat/lon
+# for every stop, and is the sole source (UIC included) for stops missing
+# here — detours and seasonal stops like Verviers or Amsterdam Bijlmer ArenA.
+STOP_NAME_TO_ES_UIC = {
+    "Bruxelles-Midi":               "8814001",
+    "Antwerpen-Centraal":           "8821006",
+    "Roosendaal":                   "8400526",
+    "Rotterdam Centraal":           "8400530",
+    "Amersfoort Centraal":          "8400055",
+    "Deventer":                     "8400173",
+    "Dresden Hbf":                  "8006050",
+    "Bad Schandau":                 "8006006",
+    "Decin hl.n.":                  "5455659",
+    "Usti nad Labem hl.n.":         "5453179",
+    "Prague hl.n. (main station)":  "5457076",
+    "Den Haag HS":                  "8400280",
+    "Amsterdam Centraal":           "8400058",
+    "Berlin Hauptbahnhof":          "8065969",
+    "Berlin Ostbahnhof":            "8003004",
+    "Aulnoye-Aymeries":             "8729560",
+    "Mons":                         "8881000",
+    "Liège-Guillemins":             "8841004",
+    "Hamburg-Harburg":              "8001134",
+    "Paris Nord":                   "8727100",
+    "Aachen Hbf":                   "8015345",
+    "Köln Hbf":                     "8015458",
+    "Arth-Goldau":                  "8505004",
+    "Göschenen":                    "8505119",
+    "Bellinzona":                   "8505213",
+    "Lugano":                       "8505300",
+    "Como S. Giovanni":             "8301307",
+    "Milano Garibaldi":             "8301645",
+    "Breda":                        "8400131",
+    "Eindhoven Centraal":           "8400206",
 }
 
-# Station data from OpenStreetMap (coordinates, ODbL) and Wikidata (UIC codes).
-# Keys must match exactly the stop names returned by the ES timetable API.
-# Format: name -> (lat, lon, UIC code, IANA timezone)
-STOP_DATA = {
-    "Prague hl.n. (main station)": (50.0833, 14.4356, "5457076", "Europe/Prague"),
-    "Usti nad Labem hl.n.":        (50.6600, 14.0400, "5453179", "Europe/Prague"),
-    "Decin hl.n.":                 (50.7742, 14.2136, "5456659", "Europe/Prague"),
-    "Bad Schandau":                (50.9156, 14.1517, "8006006", "Europe/Berlin"),
-    "Dresden Hbf":                 (51.0407, 13.7322, "8006050", "Europe/Berlin"),
-    "Berlin Ostbahnhof":           (52.5103, 13.4343, "8003137", "Europe/Berlin"),
-    "Berlin Hauptbahnhof":         (52.5251, 13.3694, "8033452", "Europe/Berlin"),
-    "Berlin Gesundbrunnen":        (52.5487, 13.3887, "8007799", "Europe/Berlin"),
-    "Berlin-Spandau":              (52.5341, 13.1978, "8003025", "Europe/Berlin"),
-    "Arnhem Centraal":             (51.9850,  5.8993, "8400071", "Europe/Amsterdam"),
-    "Deventer":                    (52.2558,  6.1580, "8400173", "Europe/Amsterdam"),
-    "Amersfoort Centraal":         (52.1531,  5.3789, "8400055", "Europe/Amsterdam"),
-    "Amsterdam Bijlmer ArenA":     (52.3126,  4.9469, "8400074", "Europe/Amsterdam"),
-    "Amsterdam Centraal":          (52.3791,  4.8997, "8400058", "Europe/Amsterdam"),
-    "Utrecht Centraal":            (52.0894,  5.1100, "8400621", "Europe/Amsterdam"),
-    "Den Haag HS":                 (52.0697,  4.3242, "8400280", "Europe/Amsterdam"),
-    "Rotterdam Centraal":          (51.9248,  4.4689, "8400530", "Europe/Amsterdam"),
-    "Breda":                       (51.5956,  4.7797, "8400131", "Europe/Amsterdam"),
-    "Roosendaal":                  (51.5292,  4.4636, "8400526", "Europe/Amsterdam"),
-    "Antwerpen-Centraal":          (51.2172,  4.4214, "8821006", "Europe/Brussels"),
-    "Bruxelles-Midi":              (50.8358,  4.3356, "8814001", "Europe/Brussels"),
-    "Hamburg-Harburg":             (53.4566,  9.9922, "8001726", "Europe/Berlin"),
-    "Paris Nord":                  (48.8809,  2.3553, "8727103", "Europe/Paris"),
-    "Aulnoye-Aymeries":            (50.2028,  3.8408, "8729560", "Europe/Paris"),
-    "Mons":                        (50.4542,  3.9517, "8881000", "Europe/Brussels"),
-    "Liège-Guillemins":            (50.6242,  5.5664, "8841004", "Europe/Brussels"),
-    "Milano Garibaldi":            (45.4847,  9.1883, "8301662", "Europe/Rome"),
-    "Como S. Giovanni":            (45.8056,  9.0817, "8301307", "Europe/Rome"),
-    "Chiasso":                     (45.8408,  9.0319, "8505307", "Europe/Zurich"),
-    "Lugano":                      (46.0044,  8.9475, "8505300", "Europe/Zurich"),
-    "Bellinzona":                  (46.1958,  9.0175, "8500122", "Europe/Zurich"),
-    "Göschenen":                   (46.6653,  8.5847, "8505119", "Europe/Zurich"),
-    "Arth-Goldau":                 (47.0467,  8.5478, "8505004", "Europe/Zurich"),
-    "Aarau":                       (47.3917,  8.0506, "8502113", "Europe/Zurich"),
-    "Zürich HB":                   (47.3781,  8.5400, "8500010", "Europe/Zurich"),
-    "Köln Hbf":                    (50.9428,  6.9586, "8015458", "Europe/Berlin"),
-    "Aachen Hbf":                  (50.7678,  6.0908, "8015345", "Europe/Berlin"),
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+
+# Tried in order until one yields a match; covers the languages of the
+# countries ES timetables run through.
+SEARCH_LANGUAGES = ["en", "fr", "de", "nl", "it", "cs"]
+
+COUNTRY_TIMEZONE = {
+    "Czech Republic":     "Europe/Prague",
+    "Germany":            "Europe/Berlin",
+    "Netherlands":        "Europe/Amsterdam",
+    "Belgium":            "Europe/Brussels",
+    "France":             "Europe/Paris",
+    "Switzerland":         "Europe/Zurich",
+    "Italy":              "Europe/Rome",
 }
+
+
+def clean_station_name(name: str) -> str:
+    """Strip qualifiers that hurt Wikidata's search but don't identify the station."""
+    name = re.sub(r"\(.*?\)", "", name)          # "(main station)"
+    name = re.sub(r"\bhl\.?\s*n\.?\b\.?", "", name, flags=re.IGNORECASE)  # Czech "hl.n."
+    name = re.sub(r"\bS\.\s*", "San ", name)      # Italian "S." abbreviation
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def query_wikidata_stations(search_term: str, language: str) -> list[dict]:
+    """Search Wikidata for railway stations matching search_term, best match first."""
+    query = f"""
+    SELECT ?item ?itemLabel ?uic ?coord ?countryLabel ?rank WHERE {{
+      SERVICE wikibase:mwapi {{
+        bd:serviceParam wikibase:api "EntitySearch".
+        bd:serviceParam wikibase:endpoint "www.wikidata.org".
+        bd:serviceParam mwapi:search "{search_term}".
+        bd:serviceParam mwapi:language "{language}".
+        ?item wikibase:apiOutputItem mwapi:item.
+        ?rank wikibase:apiOrdinal true.
+      }}
+      ?item wdt:P31/wdt:P279* wd:Q55488.  # instance of (a subclass of) railway station
+      ?item wdt:P722 ?uic.
+      ?item wdt:P625 ?coord.
+      ?item wdt:P17 ?country.
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+    }}
+    ORDER BY ?rank
+    """
+    response = WIKIDATA_HTTP.get(
+        WIKIDATA_SPARQL,
+        params={"query": query, "format": "json"},
+        headers={"Accept": "application/sparql-results+json"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.json()["results"]["bindings"]
+
+
+def query_wikidata_coords_by_uic(uic: str) -> tuple[float, float, str] | None:
+    """Look up (lat, lon, country) on Wikidata for a station identified by its exact UIC code."""
+    query = f"""
+    SELECT ?coord ?countryLabel WHERE {{
+      ?item wdt:P722 "{uic}".
+      ?item wdt:P625 ?coord.
+      OPTIONAL {{ ?item wdt:P17 ?country. }}
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+    }}
+    LIMIT 1
+    """
+    response = WIKIDATA_HTTP.get(
+        WIKIDATA_SPARQL,
+        params={"query": query, "format": "json"},
+        headers={"Accept": "application/sparql-results+json"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    bindings = response.json()["results"]["bindings"]
+    if not bindings:
+        return None
+    lon, lat = map(float, bindings[0]["coord"]["value"][6:-1].split())
+    country = bindings[0].get("countryLabel", {}).get("value")
+    return lat, lon, country
+
+
+_station_cache: dict[str, dict] = {}
+
+
+def resolve_station(name: str) -> dict:
+    """
+    Resolve a stop name to its coordinates, UIC code and timezone.
+
+    Returns {"lat", "lon", "uic", "timezone"}, or None if nothing matched.
+    """
+    if name in _station_cache:
+        return _station_cache[name]
+
+    es_uic = STOP_NAME_TO_ES_UIC.get(name)
+    if es_uic:
+        coords = query_wikidata_coords_by_uic(es_uic)
+        if coords:
+            lat, lon, country = coords
+            result = {"lat": lat, "lon": lon, "uic": es_uic, "timezone": COUNTRY_TIMEZONE.get(country)}
+            _station_cache[name] = result
+            return result
+
+    cleaned = clean_station_name(name)
+    bindings = []
+    for language in SEARCH_LANGUAGES:
+        bindings = query_wikidata_stations(cleaned, language)
+        if bindings:
+            break
+
+    if not bindings:
+        _station_cache[name] = None
+        return None
+
+    # A single station can list more than one UIC code; keep the smallest
+    # deterministically. Distinct stations (different Wikidata items) are
+    # a real ambiguity worth flagging.
+    by_item = {}
+    for b in bindings:
+        item = b["item"]["value"]
+        by_item.setdefault(item, []).append(b)
+
+    if len(by_item) > 1:
+        candidates = ", ".join(
+            f"{group[0]['itemLabel']['value']} (UIC {min(g['uic']['value'] for g in group)})"
+            for group in by_item.values()
+        )
+        print(f"⚠  Ambiguous station match for {name!r}: {candidates} — using the first")
+
+    best_group = next(iter(by_item.values()))
+    lon, lat = map(float, best_group[0]["coord"]["value"][6:-1].split())
+    country = best_group[0]["countryLabel"]["value"]
+    timezone = COUNTRY_TIMEZONE.get(country)
+    uic = es_uic or min(g["uic"]["value"] for g in best_group)
+
+    result = {"lat": lat, "lon": lon, "uic": uic, "timezone": timezone}
+    _station_cache[name] = result
+    return result
 
 
 # ── Fetching data from the ES website ─────────────────────────────────────────
@@ -106,14 +249,25 @@ def fetch_date_range() -> tuple[date, date]:
     return date.today(), date(year, month, day_)
 
 
-def fetch_timetable(route_id: int, day: date) -> str:
-    """Call the ES timetable API and return the raw HTML response."""
+def fetch_timetable(day: date) -> str:
+    """Call the ES timetable API for a single day, across all routes, and return the raw HTML response."""
     response = HTTP.post(
         "https://www.europeansleeper.eu/timetable/run",
-        data={"departure-date-sql": day.isoformat(), "r": route_id},
+        data={"departure-date-sql": day.isoformat(), "r": 0},
         timeout=15,
     )
     return response.text
+
+
+def split_by_train(html: str) -> dict[str, str]:
+    """Split a multi-route /timetable/run response into one HTML chunk per train number."""
+    chunks = {}
+    matches = list(re.finditer(r'<div[^>]*\bid="(\d+)"', html))
+    for i, match in enumerate(matches):
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(html)
+        chunks[match.group(1)] = html[start:end]
+    return chunks
 
 
 def parse_stops(html: str) -> list[dict]:
@@ -162,45 +316,51 @@ def parse_stops(html: str) -> list[dict]:
 
 def scan_season(start: date, end: date) -> list[dict]:
     """
-    Fetch every day for every route between start and end.
+    Fetch every day between start and end, one request covering all routes at once.
 
-    Groups days by stop pattern (fingerprint). When the same route has a
-    different set of stops on different dates (e.g. Hamburg added in July),
-    those become separate variants, each getting their own GTFS trip.
+    Groups days by stop pattern (fingerprint) per train. When the same route
+    has a different set of stops on different dates (e.g. Hamburg added in
+    July), those become separate variants, each getting their own GTFS trip.
     """
+    # train_number → { stop-name-tuple → { stops, dates[] } }
+    variants_by_train = {train: {} for train in TRAIN_NUMBERS}
+    train_numbers = set(TRAIN_NUMBERS)
+
+    current_day = start
+    day_count = 0
+    total_days = (end - start).days + 1
+
+    while current_day <= end:
+        html = fetch_timetable(current_day)
+
+        if html.strip() and "Systeemfout" not in html:
+            chunks = split_by_train(html)
+
+            for train_number, chunk in chunks.items():
+                if train_number not in train_numbers:
+                    continue
+                stops = parse_stops(chunk)
+                if not stops:
+                    continue
+
+                pattern = tuple(s["name"] for s in stops)
+                variants_found = variants_by_train[train_number]
+                if pattern not in variants_found:
+                    variants_found[pattern] = {"stops": stops, "dates": []}
+                variants_found[pattern]["dates"].append(current_day.isoformat())
+
+        day_count += 1
+        if day_count % 14 == 0:
+            print(".", end="", flush=True)
+
+        current_day += timedelta(days=1)
+
+    print(f" ✓  scanned {total_days} days\n")
+
     all_variants = []
-
-    for route_id, train_number in ROUTES.items():
-        print(f"ES {train_number}", end="  ", flush=True)
-
-        # Maps stop-name-tuple → { stops, dates[] }
-        variants_found = {}
-
-        current_day = start
-        day_count = 0
-
-        while current_day <= end:
-            html = fetch_timetable(route_id, current_day)
-
-            if html.strip() and "Systeemfout" not in html:
-                stops = parse_stops(html)
-                if stops:
-                    # Use the ordered list of stop names as a unique key
-                    pattern = tuple(s["name"] for s in stops)
-
-                    if pattern not in variants_found:
-                        variants_found[pattern] = {"stops": stops, "dates": []}
-
-                    variants_found[pattern]["dates"].append(current_day.isoformat())
-
-            day_count += 1
-            if day_count % 14 == 0:
-                print(".", end="", flush=True)
-
-            current_day += timedelta(days=1)
-
+    for train_number, variants_found in variants_by_train.items():
         total_operating_days = sum(len(v["dates"]) for v in variants_found.values())
-        print(f" ✓  {len(variants_found)} variant(s), {total_operating_days} operating days")
+        print(f"ES {train_number}  {len(variants_found)} variant(s), {total_operating_days} operating days")
 
         for i, variant in enumerate(variants_found.values(), start=1):
             variant_id = f"ES{train_number}_v{i}"
@@ -308,9 +468,13 @@ def build_routes_file(variants: list[dict]) -> str:
             seen.add(route_id)
             rows.append([
                 route_id, "ES", f"ES {v['train']}", f"{v['origin']} → {v['destination']}", 2,
-                "https://www.europeansleeper.eu/en/timetable",
+                "https://www.europeansleeper.eu/en/timetable", ROUTE_COLOR, ROUTE_TEXT_COLOR,
             ])
-    return make_csv(["route_id", "agency_id", "route_short_name", "route_long_name", "route_type", "route_url"], rows)
+    return make_csv(
+        ["route_id", "agency_id", "route_short_name", "route_long_name", "route_type", "route_url",
+         "route_color", "route_text_color"],
+        rows,
+    )
 
 
 # Even-numbered trains (452/474/400) travel east/south, direction_id 0.
@@ -318,13 +482,28 @@ def build_routes_file(variants: list[dict]) -> str:
 DIRECTION = {"452": 0, "453": 1, "474": 0, "475": 1, "400": 0, "401": 1}
 
 
+def fetch_bicycle_reservation_windows() -> list[tuple[date, date]]:
+    """Fetch the date ranges ES currently accepts bicycles for, from their booking API."""
+    response = HTTP.get(ES_CONSTANTS_API, timeout=15)
+    response.raise_for_status()
+    windows = response.json()["settings"]["bicycleReservationDates"]
+    return [(date.fromisoformat(w["start"]), date.fromisoformat(w["end"])) for w in windows]
+
+
+def trip_allows_bikes(dates: list[str], windows: list[tuple[date, date]]) -> bool:
+    """A trip allows bikes if any of its operating dates falls in a bicycle reservation window."""
+    trip_dates = [date.fromisoformat(d) for d in dates]
+    return any(start <= d <= end for d in trip_dates for start, end in windows)
+
+
 def build_trips_file(variants: list[dict]) -> str:
+    bike_windows = fetch_bicycle_reservation_windows()
     rows = [
         [
             f"ES{v['train']}", v["id"], v["id"], v["destination"], f"ES {v['train']}",
             DIRECTION[v["train"]],
-            2,  # wheelchair_accessible: 2 = no accessibility information / not accessible
-            2,  # bikes_allowed: 2 = no bikes allowed (suspended as of 2026)
+            2,  # wheelchair_accessible: 2 = not accessible (ES: trains do not meet accessibility requirements)
+            1 if trip_allows_bikes(v["dates"], bike_windows) else 2,
         ]
         for v in variants
     ]
@@ -352,15 +531,14 @@ def build_stops_file(variants: list[dict]) -> str:
             sid = make_stop_id(stop["name"])
             if sid in stops_seen:
                 continue
-            data = STOP_DATA.get(stop["name"])
+            data = resolve_station(stop["name"])
             if data:
-                lat, lon, uic_code, timezone = data
-                stops_seen[sid] = (stop["name"], lat, lon, uic_code, timezone)
+                stops_seen[sid] = (stop["name"], data["lat"], data["lon"], data["uic"], data["timezone"])
             else:
                 missing.add(stop["name"])
 
     if missing:
-        print(f"⚠  No data for: {', '.join(sorted(missing))}")
+        raise RuntimeError(f"No Wikidata match for stations: {', '.join(sorted(missing))}")
 
     rows = [
         [sid, name, lat, lon, uic_code, timezone]
@@ -403,7 +581,7 @@ def build_attributions_file() -> str:
         ["attribution_id", "organization_name", "is_producer", "is_operator", "is_authority", "attribution_url"],
         [
             ["1", "European Sleeper", "0", "1", "0", "https://www.europeansleeper.eu"],
-            ["2", "OpenStreetMap contributors", "1", "0", "0", "https://www.openstreetmap.org"],
+            ["2", "Wikidata contributors", "1", "0", "0", "https://www.wikidata.org"],
         ],
     )
 

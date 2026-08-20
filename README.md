@@ -1,8 +1,12 @@
 # gtfs-european-sleeper
 
-[GTFS](https://gtfs.org) feed for **European Sleeper** night trains.
+A [GTFS](https://gtfs.org) feed for European Sleeper night trains, built from data European Sleeper doesn't publish as GTFS themselves.
 
-Timetable: **1 Jun 2026 – 8 Nov 2026** · 6 routes · 23 trip variants · 36 stops · 657 service dates
+## Why this exists
+
+European Sleeper only publishes a timetable page meant for humans. There's no official GTFS feed, so this scrapes and reassembles one: which trains run on which days, what stops they make, and where those stops actually are.
+
+This feed also feeds into [Panto](https://getpanto.app), a real-time train tracking app currently in beta.
 
 ## Download
 
@@ -10,16 +14,19 @@ Timetable: **1 Jun 2026 – 8 Nov 2026** · 6 routes · 23 trip variants · 36 s
 
 ## Trains
 
-| Train | Route | Notes |
-|-------|-------|-------|
-| ES 452 | Prague → Brussels | 4 variants (Amsterdam rerouting mid-Jun, Berlin Gesundbrunnen from 14 Jun, Arnhem diversion Jun-Sep) |
-| ES 453 | Brussels → Prague | 4 variants (mirrors ES 452) |
-| ES 474 | Berlin → Paris | 7 variants (Berlin-Spandau diversion mid-Jun, Hamburg added 13 Jul) |
-| ES 475 | Paris → Berlin | 6 variants (Berlin Gesundbrunnen Jun, Hamburg added 12 Jul) |
-| ES 400 | Milan → Brussels | 1 variant, starts 9 Sep 2026 |
-| ES 401 | Brussels → Milan | 1 variant, starts 9 Sep 2026 |
+European Sleeper's night trains connect stations like Amsterdam Centraal, Brussels Midi, Berlin Hauptbahnhof, Prague hl.n., Paris Nord and Milano Garibaldi. The exact lineup of routes shifts as they add or drop connections, so this doesn't hardcode a list of them anywhere.
 
-Uses `calendar_dates.txt` (explicit per-date entries) to capture all timetable variations correctly.
+Each train can also run several different stop patterns across a season: reroutes, added or dropped stops, seasonal detours. The feed captures all of them as separate trip variants tied to the specific dates they ran.
+
+## Where the data comes from
+
+| Source | What it provides |
+|--------|-------------------|
+| `europeansleeper.eu/timetable/run` | The endpoint behind their timetable page. Not documented anywhere, found by watching the network tab while using the site. Returns per-day HTML for every route in one call, which this scrapes for stop names and times. |
+| `europeansleeperprod-api.azurewebsites.net/api/constants` | The booking backend's config endpoint. Gives the UIC code for every station ES sells tickets to and from, straight from the operator instead of guessed from a third party. |
+| [Wikidata](https://www.wikidata.org) | Coordinates and timezone for every stop, plus UIC codes for detour/seasonal stations that don't show up in the booking API. |
+
+Cross-checking the booking API against Wikidata turned up a couple of wrong UIC codes on Wikidata itself (Berlin Hbf, Paris Nord), worth knowing if you're pulling station data from there for anything else in this corridor.
 
 ## Generating
 
@@ -30,14 +37,16 @@ pip install requests
 python3 generate.py
 ```
 
-Fetches live timetable data from the European Sleeper website (~1200 requests, ~2 min).
-The feed is also regenerated automatically every Monday via GitHub Actions.
+Scans the current season day by day, then resolves every station name it found. Takes a few minutes. Runs automatically every Monday via GitHub Actions.
 
-## Sources
+## Limitations
 
-- [European Sleeper timetable](https://www.europeansleeper.eu/en/timetable) (live data via `/timetable/run` API)
-- [OpenStreetMap](https://www.openstreetmap.org) (station coordinates, ODbL)
+- No fares: European Sleeper's pricing is dynamic and this feed is only rebuilt weekly, so baking in prices would just mean shipping stale ones.
+- No shapes: there's no route geometry source that doesn't involve map-matching against OSM, which felt out of scope for what's otherwise a schedule feed.
+- Station names come from whatever European Sleeper's site returns that day. Ambiguous matches against Wikidata get logged rather than silently guessed.
 
 ## License
 
-Feed: [CC0](https://creativecommons.org/publicdomain/zero/1.0/) · Coordinates: © OpenStreetMap contributors, [ODbL](https://opendatacommons.org/licenses/odbl/)
+Feed: [CC0](https://creativecommons.org/publicdomain/zero/1.0/). Station data: © Wikidata contributors, CC0.
+
+Not affiliated with European Sleeper Exploitatie B.V. or the European Sleeper Coöperatie U.A.
