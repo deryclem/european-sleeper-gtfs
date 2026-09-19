@@ -1,2 +1,4 @@
 gtfs-validator-*.jar
 validation_output/
+__pycache__/
+*.pyc

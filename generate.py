@@ -10,6 +10,7 @@ Usage:
 """
 
 import re
+import time
 import zipfile
 import unicodedata
 import requests  # pip install requests
@@ -18,7 +19,7 @@ from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+_retry = Retry(total=3, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504])
 HTTP = requests.Session()
 HTTP.headers.update({
     "X-Requested-With": "XMLHttpRequest",
@@ -88,6 +89,7 @@ STOP_NAME_TO_ES_UIC = {
     "Milano Garibaldi":             "8301645",
     "Breda":                        "8400131",
     "Eindhoven Centraal":           "8400206",
+    "St-Quentin":                   "8729600",
 }
 
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
@@ -112,6 +114,7 @@ def clean_station_name(name: str) -> str:
     name = re.sub(r"\(.*?\)", "", name)          # "(main station)"
     name = re.sub(r"\bhl\.?\s*n\.?\b\.?", "", name, flags=re.IGNORECASE)  # Czech "hl.n."
     name = re.sub(r"\bS\.\s*", "San ", name)      # Italian "S." abbreviation
+    name = re.sub(r"\bSt[-.]\s*", "Saint-", name, flags=re.IGNORECASE)   # French "St-" / "St." abbreviation
     return re.sub(r"\s+", " ", name).strip()
 
 
@@ -145,8 +148,45 @@ def query_wikidata_stations(search_term: str, language: str) -> list[dict]:
     return response.json()["results"]["bindings"]
 
 
+_uic_coords_cache: dict[str, tuple[float, float, str]] = {}
+
+
+def prefetch_wikidata_uic_coords(uics: list[str]) -> None:
+    """Batch-fetch coordinates and country for UIC codes in a single Wikidata SPARQL query."""
+    if not uics:
+        return
+    uic_str = " ".join(f'"{u}"' for u in set(uics) if u)
+    query = f"""
+    SELECT ?uic ?coord ?countryLabel WHERE {{
+      VALUES ?uic {{ {uic_str} }}
+      ?item wdt:P722 ?uic.
+      ?item wdt:P625 ?coord.
+      OPTIONAL {{ ?item wdt:P17 ?country. }}
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+    }}
+    """
+    try:
+        response = WIKIDATA_HTTP.get(
+            WIKIDATA_SPARQL,
+            params={"query": query, "format": "json"},
+            headers={"Accept": "application/sparql-results+json"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        for b in response.json()["results"]["bindings"]:
+            u = b["uic"]["value"]
+            lon, lat = map(float, b["coord"]["value"][6:-1].split())
+            country = b.get("countryLabel", {}).get("value")
+            _uic_coords_cache[u] = (lat, lon, country)
+    except Exception as e:
+        print(f"⚠ Batch UIC prefetch failed ({e}), falling back to individual queries")
+
+
 def query_wikidata_coords_by_uic(uic: str) -> tuple[float, float, str] | None:
     """Look up (lat, lon, country) on Wikidata for a station identified by its exact UIC code."""
+    if uic in _uic_coords_cache:
+        return _uic_coords_cache[uic]
+
     query = f"""
     SELECT ?coord ?countryLabel WHERE {{
       ?item wdt:P722 "{uic}".
@@ -168,7 +208,9 @@ def query_wikidata_coords_by_uic(uic: str) -> tuple[float, float, str] | None:
         return None
     lon, lat = map(float, bindings[0]["coord"]["value"][6:-1].split())
     country = bindings[0].get("countryLabel", {}).get("value")
-    return lat, lon, country
+    result = (lat, lon, country)
+    _uic_coords_cache[uic] = result
+    return result
 
 
 _station_cache: dict[str, dict] = {}
@@ -442,6 +484,8 @@ def build_stop_times(stops: list[dict]) -> list[tuple[str, str]]:
 def make_csv(headers: list[str], rows: list[list]) -> str:
     """Build a CSV string with quoted fields."""
     def quote(value):
+        if value is None:
+            return '""'
         return '"' + str(value).replace('"', '""') + '"'
 
     lines = [",".join(headers)]
@@ -523,6 +567,7 @@ def build_calendar_dates_file(variants: list[dict]) -> str:
 
 
 def build_stops_file(variants: list[dict]) -> str:
+    prefetch_wikidata_uic_coords(list(STOP_NAME_TO_ES_UIC.values()))
     stops_seen = {}  # stop_id → (name, lat, lon, uic_code, timezone)
     missing = set()
 
