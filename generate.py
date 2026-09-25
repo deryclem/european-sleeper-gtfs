@@ -14,7 +14,9 @@ import time
 import zipfile
 import unicodedata
 import requests  # pip install requests
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from functools import cache
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -44,6 +46,9 @@ TIMETABLE_PAGE   = "https://www.europeansleeper.eu/en/timetable"
 TRAIN_NUMBERS = ["453", "452", "475", "474", "401", "400"]
 
 ES_CONSTANTS_API = "https://europeansleeperprod-api.azurewebsites.net/api/constants"
+
+# All ES stations are on Central European Time, so GTFS times use one zone.
+AGENCY_TIMEZONE = ZoneInfo("Europe/Brussels")
 
 # ES's brand color (bg-dark-aubergine on booking.europeansleeper.eu).
 ROUTE_COLOR = "40002C"
@@ -90,6 +95,7 @@ STOP_NAME_TO_ES_UIC = {
     "Breda":                        "8400131",
     "Eindhoven Centraal":           "8400206",
     "St-Quentin":                   "8729600",
+    "Verviers":                     "8844008",
 }
 
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
@@ -291,25 +297,62 @@ def fetch_date_range() -> tuple[date, date]:
     return date.today(), date(year, month, day_)
 
 
+SERVER_ERROR_RETRY_DELAYS = [10, 30, 90]  # seconds
+
+# If ES keeps failing on a day, the feed stops the day before, unless that
+# leaves less than this many days of timetable.
+MIN_FEED_DAYS = 30
+
+
+class TimetableServerError(RuntimeError):
+    pass
+
+
 def fetch_timetable(day: date) -> str:
-    """Call the ES timetable API for a single day, across all routes, and return the raw HTML response."""
-    response = HTTP.post(
-        "https://www.europeansleeper.eu/timetable/run",
-        data={"departure-date-sql": day.isoformat(), "r": 0},
-        timeout=15,
-    )
-    return response.text
+    """
+    Call the ES timetable API for a single day, across all routes, and return the raw HTML response.
+
+    ES answers server errors with a 200 "Systeemfout" page. Those are retried,
+    then raised: skipping the day would silently drop its trains from the feed.
+    """
+    for delay in [*SERVER_ERROR_RETRY_DELAYS, None]:
+        response = HTTP.post(
+            "https://www.europeansleeper.eu/timetable/run",
+            data={"departure-date-sql": day.isoformat(), "r": 0},
+            timeout=15,
+        )
+        if "Systeemfout" not in response.text:
+            return response.text
+        if delay is None:
+            raise TimetableServerError(f"ES timetable returned a server error for {day} after {len(SERVER_ERROR_RETRY_DELAYS)} retries.")
+        print(f"\n⚠  ES server error for {day}, retrying in {delay}s")
+        time.sleep(delay)
 
 
-def split_by_train(html: str) -> dict[str, str]:
-    """Split a multi-route /timetable/run response into one HTML chunk per train number."""
-    chunks = {}
+def split_by_train(html: str) -> list[tuple[str, str]]:
+    """Split a multi-route /timetable/run response into (train number, HTML chunk) pairs."""
+    chunks = []
     matches = list(re.finditer(r'<div[^>]*\bid="(\d+)"', html))
     for i, match in enumerate(matches):
         start = match.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(html)
-        chunks[match.group(1)] = html[start:end]
+        chunks.append((match.group(1), html[start:end]))
     return chunks
+
+
+def parse_departure_date(html: str) -> date | None:
+    """
+    Extract the actual departure date from a train's header table.
+
+    The response for a given day also lists trains that left the day before
+    and arrive that day, so the requested date isn't the departure date:
+        <td>Wed 23 September 2026</td>   ← departure
+        <td>Thu 24 September 2026</td>   ← arrival
+    """
+    match = re.search(r'<td>\s*\w+ (\d{1,2} \w+ \d{4})\s*</td>', html)
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%d %B %Y").date()
 
 
 def parse_stops(html: str) -> list[dict]:
@@ -360,36 +403,55 @@ def scan_season(start: date, end: date) -> list[dict]:
     """
     Fetch every day between start and end, one request covering all routes at once.
 
-    Groups days by stop pattern (fingerprint) per train. When the same route
-    has a different set of stops on different dates (e.g. Hamburg added in
+    Each run is dated by the departure date in its header, not the requested
+    day, and is kept once even though it shows up in two consecutive responses.
+
+    Groups runs by stop pattern (fingerprint) per train. When the same route
+    has different stops or times on different dates (e.g. Hamburg added in
     July), those become separate variants, each getting their own GTFS trip.
     """
-    # train_number → { stop-name-tuple → { stops, dates[] } }
+    # train_number → { (name, arrival, departure)-tuple → { stops, dates[] } }
     variants_by_train = {train: {} for train in TRAIN_NUMBERS}
     train_numbers = set(TRAIN_NUMBERS)
+    seen_runs = set()  # (train_number, departure date)
 
     current_day = start
     day_count = 0
     total_days = (end - start).days + 1
 
     while current_day <= end:
-        html = fetch_timetable(current_day)
+        try:
+            html = fetch_timetable(current_day)
+        except TimetableServerError as error:
+            # Every train departing before this day was already listed, so
+            # stopping here leaves a shorter but complete feed.
+            if (current_day - start).days < MIN_FEED_DAYS:
+                raise RuntimeError(f"{error} Not writing a feed shorter than {MIN_FEED_DAYS} days.") from error
+            print(f"\n⚠  {error} The feed will end on {current_day - timedelta(days=1)}.")
+            total_days = (current_day - start).days
+            break
 
-        if html.strip() and "Systeemfout" not in html:
+        if html.strip():
             chunks = split_by_train(html)
 
-            for train_number, chunk in chunks.items():
+            for train_number, chunk in chunks:
                 if train_number not in train_numbers:
+                    continue
+                departure_date = parse_departure_date(chunk)
+                if departure_date is None:
+                    raise RuntimeError(f"No departure date for ES {train_number} on {current_day}. The page structure may have changed.")
+                if (train_number, departure_date) in seen_runs:
                     continue
                 stops = parse_stops(chunk)
                 if not stops:
                     continue
+                seen_runs.add((train_number, departure_date))
 
-                pattern = tuple(s["name"] for s in stops)
+                pattern = tuple((s["name"], s["arrival"], s["departure"]) for s in stops)
                 variants_found = variants_by_train[train_number]
                 if pattern not in variants_found:
                     variants_found[pattern] = {"stops": stops, "dates": []}
-                variants_found[pattern]["dates"].append(current_day.isoformat())
+                variants_found[pattern]["dates"].append(departure_date.isoformat())
 
         day_count += 1
         if day_count % 14 == 0:
@@ -437,28 +499,32 @@ def make_stop_id(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", without_accents.lower()).strip("_")
 
 
-def to_gtfs_time(hhmm: str, extra_minutes: int) -> str:
+def to_gtfs_time(service_day: date, hhmm: str, days_later: int) -> str:
     """
-    Convert "HH:MM" to a GTFS time string, adding extra_minutes for overnight offsets.
+    Convert a local "HH:MM" clock time to a GTFS time for the given service day.
 
-    GTFS allows times past 24:00 for trips that cross midnight, e.g. "29:09:00"
-    means 05:09 the next day. extra_minutes is a multiple of 24*60 incremented
-    each time the train crosses midnight.
+    GTFS times count the time elapsed since "noon minus 12h" on the service day,
+    so "29:09:00" usually means 05:09 the next day. On the nights clocks change,
+    that same 05:09 becomes "30:09:00" in October and "28:09:00" in March.
     """
     hours, minutes = map(int, hhmm.split(":"))
-    total_minutes = hours * 60 + minutes + extra_minutes
+    clock_day = service_day + timedelta(days=days_later)
+    local = datetime(clock_day.year, clock_day.month, clock_day.day, hours, minutes, tzinfo=AGENCY_TIMEZONE)
+    noon = datetime(service_day.year, service_day.month, service_day.day, 12, tzinfo=AGENCY_TIMEZONE)
+    # Subtract in UTC: Python ignores offsets when both datetimes share a tzinfo.
+    elapsed = local.astimezone(timezone.utc) - (noon.astimezone(timezone.utc) - timedelta(hours=12))
+    total_minutes = int(elapsed.total_seconds()) // 60
     return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}:00"
 
 
-
-def build_stop_times(stops: list[dict]) -> list[tuple[str, str]]:
+def build_stop_times(stops: list[dict], service_day: date) -> list[tuple[str, str]]:
     """
     Return a (arrival, departure) GTFS time pair for each stop.
     Detects midnight crossings by watching for times that go backwards.
     """
     result = []
     previous_departure_minutes = -1
-    overnight_offset = 0  # increases by 24*60 each time the train crosses midnight
+    days_later = 0  # increases by 1 each time the train crosses midnight
 
     for stop in stops:
         reference_time = stop["arrival"] or stop["departure"] or "00:00"
@@ -466,18 +532,38 @@ def build_stop_times(stops: list[dict]) -> list[tuple[str, str]]:
         current_minutes = ref_hours * 60 + ref_mins
 
         if previous_departure_minutes >= 0 and current_minutes < previous_departure_minutes - 30:
-            overnight_offset += 24 * 60
+            days_later += 1
 
         last_time = stop["departure"] or stop["arrival"] or "00:00"
         last_h, last_m = map(int, last_time.split(":"))
         previous_departure_minutes = last_h * 60 + last_m
 
-        arrival   = to_gtfs_time(stop["arrival"],   overnight_offset) if stop["arrival"]   else None
-        departure = to_gtfs_time(stop["departure"], overnight_offset) if stop["departure"] else None
+        arrival   = to_gtfs_time(service_day, stop["arrival"],   days_later) if stop["arrival"]   else None
+        departure = to_gtfs_time(service_day, stop["departure"], days_later) if stop["departure"] else None
 
         # First stop: no arrival, use departure. Last stop: no departure, use arrival.
         result.append((arrival or departure, departure or arrival))
 
+    return result
+
+
+def split_by_clock_change(variants: list[dict]) -> list[dict]:
+    """
+    Attach GTFS times to each variant, splitting off the dates where they differ.
+
+    A variant shares one set of stop_times across all its dates, but a night
+    train running when the clocks change gets times shifted by an hour, so
+    those dates become a separate trip (e.g. ES453_v3 and ES453_v3_2).
+    """
+    result = []
+    for v in variants:
+        dates_by_times = {}
+        for day in v["dates"]:
+            times = tuple(build_stop_times(v["stops"], date.fromisoformat(day)))
+            dates_by_times.setdefault(times, []).append(day)
+        for i, (times, dates) in enumerate(dates_by_times.items(), start=1):
+            variant_id = v["id"] if i == 1 else f"{v['id']}_{i}"
+            result.append({**v, "id": variant_id, "dates": dates, "times": list(times)})
     return result
 
 
@@ -498,7 +584,7 @@ def make_csv(headers: list[str], rows: list[list]) -> str:
 def build_agency_file() -> str:
     return make_csv(
         ["agency_id", "agency_name", "agency_url", "agency_timezone", "agency_lang", "agency_fare_url"],
-        [["ES", "European Sleeper", "https://www.europeansleeper.eu", "Europe/Brussels", "en",
+        [["ES", "European Sleeper", "https://www.europeansleeper.eu", AGENCY_TIMEZONE.key, "en",
           "https://booking.europeansleeper.eu/en"]],
     )
 
@@ -526,12 +612,53 @@ def build_routes_file(variants: list[dict]) -> str:
 DIRECTION = {"452": 0, "453": 1, "474": 0, "475": 1, "400": 0, "401": 1}
 
 
-def fetch_bicycle_reservation_windows() -> list[tuple[date, date]]:
-    """Fetch the date ranges ES currently accepts bicycles for, from their booking API."""
+@cache
+def fetch_es_constants() -> dict:
+    """Fetch ES's booking settings (bicycle windows, sales rules…) once per run."""
     response = HTTP.get(ES_CONSTANTS_API, timeout=15)
     response.raise_for_status()
-    windows = response.json()["settings"]["bicycleReservationDates"]
+    return response.json()
+
+
+def fetch_bicycle_reservation_windows() -> list[tuple[date, date]]:
+    """Fetch the date ranges ES currently accepts bicycles for, from their booking API."""
+    windows = fetch_es_constants()["settings"]["bicycleReservationDates"]
     return [(date.fromisoformat(w["start"]), date.fromisoformat(w["end"])) for w in windows]
+
+
+def fetch_domestic_journey_disabled_countries() -> set[str]:
+    """
+    Fetch the countries where ES doesn't sell domestic trips (e.g. Amsterdam → Deventer).
+
+    ES identifies countries by their UIC country code, the first two digits of
+    a station's UIC code: "84" for the Netherlands, "88" for Belgium…
+    """
+    return set(fetch_es_constants()["domesticJourneyDisabledCountries"])
+
+
+def boarding_rules(stops: list[dict], restricted_countries: set[str]) -> list[tuple[int, int]]:
+    """
+    Return a (pickup_type, drop_off_type) pair for each stop, 1 meaning not allowed.
+
+    GTFS can only restrict a stop, not a pair of stops, so the domestic-trip
+    rule is applied to the first and last countries of the trip: no drop-off
+    where the train starts, no pickup where it ends. A domestic trip within a
+    country the train only passes through stays possible in the feed.
+    """
+    countries = [resolve_station(s["name"])["uic"][:2] for s in stops]
+    first_country, last_country = countries[0], countries[-1]
+    leading = next((i for i, c in enumerate(countries) if c != first_country), len(countries))
+    trailing = len(countries) - next(
+        (i for i, c in enumerate(reversed(countries)) if c != last_country), len(countries)
+    )
+    single_country = leading == len(countries)
+
+    rules = []
+    for i in range(len(stops)):
+        no_drop_off = i == 0 or (not single_country and i < leading and first_country in restricted_countries)
+        no_pickup = i == len(stops) - 1 or (not single_country and i >= trailing and last_country in restricted_countries)
+        rules.append((1 if no_pickup else 0, 1 if no_drop_off else 0))
+    return rules
 
 
 def trip_allows_bikes(dates: list[str], windows: list[tuple[date, date]]) -> bool:
@@ -593,15 +720,18 @@ def build_stops_file(variants: list[dict]) -> str:
 
 
 def build_stop_times_file(variants: list[dict]) -> str:
+    restricted_countries = fetch_domestic_journey_disabled_countries()
     rows = []
     for v in variants:
-        times = build_stop_times(v["stops"])
-        for sequence, (stop, (arrival, departure)) in enumerate(zip(v["stops"], times), start=1):
+        rules = boarding_rules(v["stops"], restricted_countries)
+        for sequence, (stop, (arrival, departure), (pickup, drop_off)) in enumerate(
+            zip(v["stops"], v["times"], rules), start=1
+        ):
             sid = make_stop_id(stop["name"])
             rows.append([
                 v["id"], arrival, departure, sid, sequence,
-                0,  # pickup_type: 0 = regular scheduled pickup
-                0,  # drop_off_type: 0 = regular scheduled drop-off
+                pickup,    # pickup_type: 0 = regular, 1 = no pickup
+                drop_off,  # drop_off_type: 0 = regular, 1 = no drop-off
                 1,  # timepoint: 1 = exact scheduled times (not estimates)
             ])
     return make_csv(
@@ -632,6 +762,7 @@ def build_attributions_file() -> str:
 
 
 def build_gtfs(variants: list[dict]) -> dict[str, str]:
+    variants = split_by_clock_change(variants)
     return {
         "agency.txt":         build_agency_file(),
         "stops.txt":          build_stops_file(variants),
