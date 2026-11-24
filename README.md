@@ -1,12 +1,12 @@
 # gtfs-european-sleeper
 
-A [GTFS](https://gtfs.org) feed for European Sleeper night trains, built from data European Sleeper doesn't publish as GTFS themselves.
+Unofficial [GTFS](https://gtfs.org) feed for European Sleeper night trains, built from data European Sleeper doesn't publish as GTFS.
 
 ## Why this exists
 
-European Sleeper only publishes a timetable page meant for humans. There's no official GTFS feed, so this scrapes and reassembles one: which trains run on which days, what stops they make, and where those stops actually are.
+European Sleeper only publishes a timetable page meant for humans. This project scrapes it and rebuilds the feed: which trains run on which days, which stops they make, and where those stops are.
 
-This feed also feeds into [Panto](https://getpanto.app), a real-time train tracking app currently in beta.
+It is also used by [Panto](https://getpanto.app).
 
 ## Download
 
@@ -14,36 +14,45 @@ This feed also feeds into [Panto](https://getpanto.app), a real-time train track
 
 ## Trains
 
-European Sleeper's night trains connect stations like Amsterdam Centraal, Brussels Midi, Berlin Hauptbahnhof, Prague hl.n., Paris Nord and Milano Garibaldi. The exact lineup of routes shifts as they add or drop connections, so this doesn't hardcode a list of them anywhere.
+The feed covers the trains listed in `TRAIN_NUMBERS` in `generate.py` (452, 453, 474, 475, 400, 401). A new train number has to be added there by hand.
 
-Each train can also run several different stop patterns across a season: reroutes, added or dropped stops, seasonal detours. The feed captures all of them as separate trip variants tied to the specific dates they ran.
+When a train's stops or times change during the season, each pattern becomes its own trip variant, tied to the dates it runs. A night train running when the clocks change gets a separate trip for those dates (suffix `_2`).
 
 ## Where the data comes from
 
 | Source | What it provides |
 |--------|-------------------|
-| `europeansleeper.eu/timetable/run` | The endpoint behind their timetable page. Not documented anywhere, found by watching the network tab while using the site. Returns per-day HTML for every route in one call, which this scrapes for stop names and times. |
-| `europeansleeperprod-api.azurewebsites.net/api/constants` | The booking backend's config endpoint. Gives the UIC code for every station ES sells tickets to and from, straight from the operator instead of guessed from a third party. |
-| [Wikidata](https://www.wikidata.org) | Coordinates and timezone for every stop, plus UIC codes for detour/seasonal stations that don't show up in the booking API. |
-
-Cross-checking the booking API against Wikidata turned up a couple of wrong UIC codes on Wikidata itself (Berlin Hbf, Paris Nord), worth knowing if you're pulling station data from there for anything else in this corridor.
+| `europeansleeper.eu/timetable/run` | The endpoint behind their timetable page. Not documented. Returns per-day HTML for every route in one call, which this scrapes for stop names and times. |
+| `europeansleeperprod-api.azurewebsites.net/api/constants` | The booking backend's config endpoint. Gives UIC codes for the stations listed in `STOP_NAME_TO_ES_UIC`, the bicycle reservation periods, and the countries where domestic trips aren't sold. |
+| [Wikidata](https://www.wikidata.org) | Coordinates and timezone for every stop, plus UIC codes for stops missing from the booking API (detours, seasonal stations). |
 
 ## Generating
 
-Requires Python 3.10+.
+Requires Python 3 and `requests`.
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 python3 generate.py
 ```
 
-Scans the current season day by day, then resolves every station name it found. Takes a few minutes. Runs automatically every Monday via GitHub Actions.
+Scans from today to the last date offered by the timetable page, one request per day, then resolves each station. A GitHub Actions workflow runs it every Monday at 04:00 UTC (or on manual trigger) and commits the zip.
+
+## Data rules
+
+- Each run is dated by its departure date. The timetable endpoint returns a train under the previous day when it departs after midnight, so runs are deduplicated.
+- ES sometimes answers with a "Systeemfout" page. The request is retried 3 times (10 s, 30 s, 90 s). If it keeps failing, the feed stops the day before. If that leaves fewer than 30 days, nothing is written.
+- If `query.wikidata.org` is down or slow, generation fails and no zip is written.
+- `pickup_type` and `drop_off_type`: no pickup at the last stop and no drop-off at the first. Domestic trips are also blocked at the ends of the route in countries where ES doesn't sell them (from the `constants` endpoint).
+- `bikes_allowed` is set when one of the trip's dates falls in a bicycle reservation period.
+- `wheelchair_accessible` is 2 (not accessible), as stated by ES.
 
 ## Limitations
 
-- No fares: European Sleeper's pricing is dynamic and this feed is only rebuilt weekly, so baking in prices would just mean shipping stale ones.
-- No shapes: there's no route geometry source that doesn't involve map-matching against OSM, which felt out of scope for what's otherwise a schedule feed.
-- Station names come from whatever European Sleeper's site returns that day. Ambiguous matches against Wikidata get logged rather than silently guessed.
+- No fares: European Sleeper's pricing is dynamic and this feed is only rebuilt weekly, so baked-in prices would be stale.
+- No shapes: there is no route geometry source that doesn't involve map-matching against OSM.
+- Times are the planned ones from the timetable page. Delays, cancellations and short-notice changes aren't reflected.
+- Station names come from whatever European Sleeper's site returns that day. Ambiguous matches against Wikidata are logged rather than silently guessed.
+- Some rules above work around limits of the source data. If the source is fixed, they have no effect.
 
 ## License
 
